@@ -1,0 +1,8 @@
+firebase-admin
+numpy
+pandas
+scikit-learn
+xgboost
+joblib
+requests
+schedule
