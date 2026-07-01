@@ -130,6 +130,57 @@ def save_prediction(prediction):
         prediction
 
     )
+
+
+# ==========================================================
+# APPEND PREDICTION TO ROLLING HISTORY (for dashboard time-series)
+# ==========================================================
+
+def append_prediction_history(prediction, actual=None, max_entries=200):
+
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "predicted": prediction,
+    }
+
+    if actual is not None:
+        entry["actual"] = actual
+
+    ref = db.reference("prediction_history")
+    ref.push(entry)
+
+    all_entries = ref.get() or {}
+
+    if len(all_entries) > max_entries:
+
+        oldest_keys = sorted(all_entries.keys())[: len(all_entries) - max_entries]
+
+        for key in oldest_keys:
+            ref.child(key).delete()
+
+
+# ==========================================================
+# SAVE ALL-MODEL METRICS (for dashboard comparison charts)
+# ==========================================================
+
+def save_model_metrics(results, best_name):
+
+    payload = {
+        "_best": best_name,
+        "_updated_at": datetime.now().isoformat(),
+    }
+
+    for row in results:
+        payload[row["Model"]] = {
+            "train_r2": row["Train R2"],
+            "test_r2":  row["Test R2"],
+            "mae":      row["MAE"],
+            "mse":      row["MSE"],
+            "rmse":     row["RMSE"],
+            "samples":  row.get("samples", []),
+        }
+
+    db.reference("model_metrics").set(payload)
 # ==========================================================
 # SAVE VALIDATION DATA
 # ==========================================================

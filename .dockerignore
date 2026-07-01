@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.venv
+venv
+env
+.env
+data/*.csv
+models/*.pkl
+logs/*.csv
+*.log
+README.md
+DEPLOY.md

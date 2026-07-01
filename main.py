@@ -14,7 +14,8 @@ from training.model_selection import select_best_model
 from api.firebase_api import (
     get_live_sensor_data,
     save_prediction,
-    save_validation
+    save_validation,
+    append_prediction_history
 )
 
 from prediction.predict import predict_next_hour
@@ -117,9 +118,13 @@ def main():
 
     )
 
+    append_prediction_history(prediction, actual=sensor)
+
     print("\nPrediction saved successfully.")
 
     print("Validation data saved successfully.")
+
+    print("Prediction history appended.")
 
     print("\nSYSTEM COMPLETED")
 

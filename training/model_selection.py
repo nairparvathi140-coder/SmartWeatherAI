@@ -275,19 +275,43 @@ def select_best_model():
         # SAVE RESULTS
         # ---------------------------------------------------
 
+        # Sample pairs for the temperature target only (col 0),
+        # capped at 50 points so Firebase payload stays small.
+        y_train_temp = np.asarray(Y_train)[:, 0]
+        y_test_temp  = np.asarray(Y_test)[:, 0]
+        train_pred_temp = np.asarray(train_prediction)[:, 0]
+        test_pred_temp  = np.asarray(test_prediction)[:, 0]
+
+        rng = np.random.default_rng(config.RANDOM_STATE)
+        train_idx = rng.choice(len(y_train_temp), size=min(50, len(y_train_temp)), replace=False)
+        test_idx  = rng.choice(len(y_test_temp),  size=min(50, len(y_test_temp)),  replace=False)
+
+        samples = {
+            "train": [
+                {"actual": float(y_train_temp[i]), "predicted": float(train_pred_temp[i])}
+                for i in train_idx
+            ],
+            "test": [
+                {"actual": float(y_test_temp[i]), "predicted": float(test_pred_temp[i])}
+                for i in test_idx
+            ],
+        }
+
         results.append({
 
             "Model": name,
 
-            "Train R2": train_r2,
+            "Train R2": float(train_r2),
 
-            "Test R2": test_r2,
+            "Test R2": float(test_r2),
 
-            "MAE": mae,
+            "MAE": float(mae),
 
-            "MSE": mse,
+            "MSE": float(mse),
 
-            "RMSE": rmse
+            "RMSE": float(rmse),
+
+            "samples": samples,
 
         })
 
@@ -483,6 +507,17 @@ def select_best_model():
     if best_name in ["Random Forest", "Extra Trees"]:
 
         print("Feature Importance  :", config.FEATURE_IMPORTANCE_PATH)
+
+    # -------------------------------------------------------
+    # PUSH METRICS TO FIREBASE (for dashboard charts)
+    # -------------------------------------------------------
+
+    try:
+        from api.firebase_api import save_model_metrics
+        save_model_metrics(results, best_name)
+        print("Model metrics pushed to Firebase: /model_metrics")
+    except Exception as e:
+        print(f"Warning: could not push metrics to Firebase: {e}")
 
     print("=" * 60)
 
