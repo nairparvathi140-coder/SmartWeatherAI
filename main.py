@@ -36,6 +36,7 @@ from api.firebase_api import (
     save_validation_record,
     append_sensor_history,
     append_hourly_trend,
+    update_rolling_aggregates,
     set_pipeline_status,
 )
 
@@ -255,6 +256,13 @@ def run_hourly(station):
     append_hourly_trend(actual, date, hour, samples=n, predicted=prediction)
     recorder.write_result("hourly", actual, prediction)
     print(f"Hourly trend stored at hourly_trend/{date}/{hour} ({n} samples)")
+
+    # Refresh daily/weekly/monthly summary cards from live history.
+    try:
+        update_rolling_aggregates()
+        print("Rolling aggregates (daily/weekly/monthly) refreshed.")
+    except Exception as e:
+        print(f"Warning: could not update rolling aggregates: {e}")
 
 
 def _sample_now():

@@ -1,6 +1,6 @@
 import os
 import firebase_admin
-from datetime import datetime
+from datetime import datetime, timedelta
 from firebase_admin import credentials
 from firebase_admin import db
 
@@ -210,6 +210,57 @@ def append_sensor_history(sensor, date, time, samples=None):
 # ==========================================================
 # NESTED HOURLY TREND  (date → HH:00 → hourly-averaged reading)
 # ==========================================================
+
+def update_rolling_aggregates():
+    """Recompute analytics/{daily,weekly,monthly} from sensor_history so the
+    dashboard summary cards reflect live data instead of the legacy system's
+    stale values. Rolling windows: daily=24h, weekly=7d, monthly=30d."""
+    tree = db.reference("sensor_history").get() or {}
+    rows = []
+    for date, times in tree.items():
+        if not isinstance(times, dict):
+            continue
+        for t, reading in times.items():
+            try:
+                dt = datetime.strptime(f"{date} {t}", "%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(reading, dict):
+                rows.append((dt, reading))
+
+    if not rows:
+        return
+
+    now = datetime.now()
+
+    def _agg(days, label):
+        cutoff = now - timedelta(days=days)
+        window = [r for (dt, r) in rows if dt >= cutoff]
+        if not window:
+            return
+        out = {"total_readings": len(window), "last_updated": now.isoformat()}
+        for p in ["temperature", "humidity", "pressure"]:
+            vals = [float(r[p]) for r in window
+                    if isinstance(r.get(p), (int, float))]
+            if vals:
+                out[f"avg_{p}"] = round(sum(vals) / len(vals), 2)
+                out[f"max_{p}"] = round(max(vals), 2)
+                out[f"min_{p}"] = round(min(vals), 2)
+        if label == "daily":
+            rain = [float(r["rainfall"]) for r in window
+                    if isinstance(r.get("rainfall"), (int, float))]
+            rain_events = sum(1 for v in rain if v > 0)
+            db.reference("analytics/rainfall").update({
+                "rain_events": rain_events,
+                "no_rain_events": len(rain) - rain_events,
+                "rainfall_percentage": round(100 * rain_events / len(rain), 2) if rain else 0,
+            })
+        db.reference(f"analytics/{label}").update(out)
+
+    _agg(1, "daily")
+    _agg(7, "weekly")
+    _agg(30, "monthly")
+
 
 def append_hourly_trend(sensor, date, hour, samples=None, predicted=None):
     """Store an hour's aggregated reading at hourly_trend/{date}/{hour}."""
