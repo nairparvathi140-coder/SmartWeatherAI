@@ -35,8 +35,11 @@ from api.firebase_api import (
     get_predictions_all_models,
     save_validation_record,
     append_sensor_history,
+    append_hourly_trend,
     set_pipeline_status,
 )
+
+import recorder
 
 from prediction.predict import (
     predict_next_hour,
@@ -47,7 +50,9 @@ from prediction.predict import (
 LAST_COORDS_FILE = "models/last_coords.json"
 
 CONFIG_POLL_SECONDS = 60          # how often we check for a location change
-STORE_INTERVAL_SECONDS = 1200     # 20 min — store readings + run a cycle
+SAMPLE_INTERVAL_SECONDS = 600     # 10 min — sample a reading into the excel
+STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store
+HOURLY_INTERVAL_SECONDS = 3600    # 60 min — aggregate the hour + store trend
 SLOT_MINUTES = 20                 # nested time-slot grid (00, 20, 40)
 
 
@@ -154,44 +159,51 @@ def ensure_trained(station):
         raise
 
 
+def _window_actual(window_minutes):
+    """Aggregated reading over the trailing window from the excel buffer;
+    falls back to a single live read if the buffer is empty (fresh start)."""
+    actual, n = recorder.aggregate(window_minutes)
+    if actual is None:
+        live = get_live_sensor_data()
+        if not _sensor_feed_alive(live):
+            return None, 0
+        recorder.record_sample(live)
+        return {k: live.get(k, 0) for k in recorder.FIELDS}, 1
+    return actual, n
+
+
 def run_cycle(station):
-    """One prediction + validation cycle against live Bresser data."""
+    """20-min cycle: aggregate the excel window, validate, store (nested)."""
     print("\n" + "=" * 60)
-    print(f"PREDICTION CYCLE — {station['place']} "
+    print(f"20-MIN CYCLE — {station['place']} "
           f"({station['latitude']:.4f}, {station['longitude']:.4f})")
     print("=" * 60)
 
-    sensor = get_live_sensor_data()
-    print("\nLIVE SENSOR DATA")
-    for key, value in sensor.items():
-        print(f"  {key:15}: {value}")
-
-    if not _sensor_feed_alive(sensor):
-        print("\n!! All sensor readings are zero — Bresser feed appears dead.")
-        print("   Skipping cycle so validation history stays clean.")
+    actual, n = _window_actual(20)
+    if actual is None:
+        print("!! No live samples this window — Bresser feed dead. Skipping.")
         set_pipeline_status("no_sensor_data", station)
         return
 
+    print(f"Aggregated actual over {n} sample(s): "
+          f"temp={actual['temperature']:.2f} hum={actual['humidity']:.2f}")
     set_pipeline_status("running", station)
 
     now = datetime.now()
     date, time = _slot(now)                          # current 20-min slot
     tdate, ttime = _slot(now + timedelta(hours=1))   # slot the forecast targets
 
-    # 1. Store this slot's clean reading — nested sensor_history/{date}/{time}
-    append_sensor_history(sensor, date, time)
-    print(f"\nStored reading at sensor_history/{date}/{time}")
+    # 1. Store the aggregated reading — nested sensor_history/{date}/{time}
+    append_sensor_history(actual, date, time, samples=n)
+    print(f"Stored reading at sensor_history/{date}/{time}")
 
     # 2. Forecast next hour with all 4 models, keyed to the target slot
     all_preds = predict_with_all_models(
-        sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
-        sensor["wind_direction"], sensor["rainfall"],
-        sensor["pressure"], sensor["irradiance"],
+        actual["temperature"], actual["humidity"], actual["wind_speed"],
+        actual["wind_direction"], actual["rainfall"],
+        actual["pressure"], actual["irradiance"],
     )
     if all_preds:
-        print("NEXT-HOUR PREDICTIONS BY MODEL")
-        for name, p in all_preds.items():
-            print(f"  {name:20} temp={p['temperature']:.2f} hum={p['humidity']:.2f}")
         save_predictions_all_models(all_preds, tdate, ttime)
     else:
         print("!! No per-model .pkl files found — retrain will fix this.")
@@ -199,29 +211,65 @@ def run_cycle(station):
     # 3. Close the validation record for THIS slot (prediction made ~1h ago)
     past = get_predictions_all_models(date, time)
     if past and past.get("predictions"):
-        save_validation_record(date, time, sensor, past["predictions"])
+        save_validation_record(date, time, actual, past["predictions"])
         print(f"Validation record closed for {date} {time}")
     else:
         print(f"No prior prediction for {date} {time} — first cycle at this slot.")
 
-    # 4. Best-model next-hour forecast + nested prediction history
+    # 4. Best-model forecast + nested prediction history + results excel
     prediction = predict_next_hour(
-        sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
-        sensor["wind_direction"], sensor["rainfall"],
-        sensor["pressure"], sensor["irradiance"],
+        actual["temperature"], actual["humidity"], actual["wind_speed"],
+        actual["wind_direction"], actual["rainfall"],
+        actual["pressure"], actual["irradiance"],
     )
     save_prediction(prediction)
-    append_prediction_history(prediction, actual=sensor, date=date, time=time)
+    append_prediction_history(prediction, actual=actual, date=date, time=time)
+    recorder.write_result("twentymin", actual, prediction)
 
     set_pipeline_status("idle", station)
-    print("CYCLE COMPLETE")
+    print("20-MIN CYCLE COMPLETE")
+
+
+def run_hourly(station):
+    """Hourly: aggregate the last hour's excel → hourly_trend (nested)."""
+    actual, n = recorder.aggregate(60)
+    if actual is None:
+        return
+    now = datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    hour = f"{now.hour:02d}:00"
+
+    prediction = None
+    try:
+        prediction = predict_next_hour(
+            actual["temperature"], actual["humidity"], actual["wind_speed"],
+            actual["wind_direction"], actual["rainfall"],
+            actual["pressure"], actual["irradiance"],
+        )
+    except Exception:
+        pass
+
+    append_hourly_trend(actual, date, hour, samples=n, predicted=prediction)
+    recorder.write_result("hourly", actual, prediction)
+    print(f"Hourly trend stored at hourly_trend/{date}/{hour} ({n} samples)")
+
+
+def _sample_now():
+    """Take one live reading into the excel buffer (if the feed is alive)."""
+    live = get_live_sensor_data()
+    if _sensor_feed_alive(live):
+        recorder.record_sample(live)
+        return True
+    return False
 
 
 def run_once():
-    """Single-shot entrypoint (Cloud Run Jobs)."""
+    """Single-shot entrypoint (Cloud Run Jobs): sample, 20-min cycle, hourly."""
     station = resolve_station()
     ensure_trained(station)
+    _sample_now()
     run_cycle(station)
+    run_hourly(station)
 
 
 # ===========================================================
@@ -229,14 +277,22 @@ def run_once():
 # ===========================================================
 
 def main_loop():
-    """Continuous loop — used locally and by the Cloud Run service."""
+    """Continuous loop — used locally and by the Cloud Run service.
+
+    Three cadences off one 60s poll:
+      • sample the excel every 10 min
+      • aggregate + validate + store every 20 min
+      • aggregate the hour + store the trend every 60 min
+    """
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
-    print(f"config poll: {CONFIG_POLL_SECONDS}s · "
-          f"store interval: {STORE_INTERVAL_SECONDS // 60}min")
+    print(f"poll {CONFIG_POLL_SECONDS}s · sample {SAMPLE_INTERVAL_SECONDS // 60}min "
+          f"· cycle {STORE_INTERVAL_SECONDS // 60}min · hourly {HOURLY_INTERVAL_SECONDS // 60}min")
     print("=" * 60)
 
+    last_sample_at = 0.0
     last_cycle_at = 0.0
+    last_hourly_at = 0.0
 
     while True:
         try:
@@ -245,10 +301,20 @@ def main_loop():
             # React to a dashboard location change within one poll interval.
             retrained = ensure_trained(station)
 
-            due = (time.time() - last_cycle_at) >= STORE_INTERVAL_SECONDS
-            if retrained or due:
+            now = time.time()
+
+            if retrained or (now - last_sample_at) >= SAMPLE_INTERVAL_SECONDS:
+                if _sample_now():
+                    print("· sampled a reading into the excel")
+                last_sample_at = now
+
+            if retrained or (now - last_cycle_at) >= STORE_INTERVAL_SECONDS:
                 run_cycle(station)
-                last_cycle_at = time.time()
+                last_cycle_at = now
+
+            if (now - last_hourly_at) >= HOURLY_INTERVAL_SECONDS:
+                run_hourly(station)
+                last_hourly_at = now
 
         except Exception as e:
             print(f"ERROR: {e}")

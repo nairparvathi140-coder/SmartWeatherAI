@@ -195,14 +195,32 @@ def _trim_nested_dates(path, keep_days=14):
 # NESTED SENSOR HISTORY  (date → time → reading, every 20 min)
 # ==========================================================
 
-def append_sensor_history(sensor, date, time):
+def append_sensor_history(sensor, date, time, samples=None):
     """Store a clean reading at sensor_history/{date}/{time}.
     The date→time nesting is what renders as a scroll-down tree in the
     Firebase console. Overwriting the same (date,time) slot is idempotent."""
     clean = _clean_reading(sensor)
     clean["timestamp"] = datetime.now().isoformat()
+    if samples is not None:
+        clean["samples"] = samples
     db.reference(f"sensor_history/{date}/{time}").set(clean)
     _trim_nested_dates("sensor_history")
+
+
+# ==========================================================
+# NESTED HOURLY TREND  (date → HH:00 → hourly-averaged reading)
+# ==========================================================
+
+def append_hourly_trend(sensor, date, hour, samples=None, predicted=None):
+    """Store an hour's aggregated reading at hourly_trend/{date}/{hour}."""
+    clean = _clean_reading(sensor)
+    clean["timestamp"] = datetime.now().isoformat()
+    if samples is not None:
+        clean["samples"] = samples
+    if predicted is not None:
+        clean["predicted"] = predicted
+    db.reference(f"hourly_trend/{date}/{hour}").set(clean)
+    _trim_nested_dates("hourly_trend", keep_days=30)
 
 
 # ==========================================================
