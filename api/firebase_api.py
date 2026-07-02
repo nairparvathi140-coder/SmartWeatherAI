@@ -163,6 +163,84 @@ def append_prediction_history(prediction, actual=None, max_entries=200):
 # SAVE ALL-MODEL METRICS (for dashboard comparison charts)
 # ==========================================================
 
+# ==========================================================
+# STATION CONFIG (lat/lon/place) — read from dashboard input
+# ==========================================================
+
+def get_station_config():
+    """Return {'latitude', 'longitude', 'place'} from /station/config, or None."""
+    cfg = db.reference("station/config").get()
+    if not cfg:
+        return None
+    return {
+        "latitude": float(cfg.get("latitude", 0)),
+        "longitude": float(cfg.get("longitude", 0)),
+        "place": cfg.get("place", ""),
+    }
+
+
+def set_station_config_defaults(latitude, longitude, place="Default"):
+    """Write initial config only if none exists."""
+    ref = db.reference("station/config")
+    if not ref.get():
+        ref.set({"latitude": latitude, "longitude": longitude, "place": place})
+
+
+# ==========================================================
+# HOURLY LIVE READING BUCKET (Bresser sensor data, cleaned)
+# ==========================================================
+
+def append_live_reading(sensor, hour_key):
+    """Overwrite live_readings/{hour_key} with a clean reading (no rssi/sensor_id)."""
+    clean = {k: sensor.get(k, 0) for k in [
+        "temperature", "humidity", "wind_speed", "wind_direction",
+        "rainfall", "pressure", "irradiance"
+    ]}
+    clean["timestamp"] = datetime.now().isoformat()
+    db.reference(f"live_readings/{hour_key}").set(clean)
+
+
+# ==========================================================
+# ALL-MODEL PREDICTIONS BUCKET (forecast for a target hour)
+# ==========================================================
+
+def save_predictions_all_models(predictions_by_model, target_hour_key):
+    db.reference(f"predictions_all_models/{target_hour_key}").set({
+        "predicted_for": target_hour_key,
+        "written_at": datetime.now().isoformat(),
+        "predictions": predictions_by_model,
+    })
+
+
+def get_predictions_all_models(hour_key):
+    return db.reference(f"predictions_all_models/{hour_key}").get()
+
+
+# ==========================================================
+# VALIDATION HISTORY — actual vs 4-model predictions per hour
+# ==========================================================
+
+def save_validation_record(hour_key, actual, predictions_by_model):
+    clean_actual = {k: actual.get(k, 0) for k in [
+        "temperature", "humidity", "wind_speed", "wind_direction",
+        "rainfall", "pressure", "irradiance"
+    ]}
+    db.reference(f"validation_history/{hour_key}").set({
+        "hour": hour_key,
+        "actual": clean_actual,
+        "predictions": predictions_by_model,
+    })
+
+
+def trim_validation_history(max_entries=200):
+    ref = db.reference("validation_history")
+    entries = ref.get() or {}
+    if len(entries) > max_entries:
+        oldest = sorted(entries.keys())[: len(entries) - max_entries]
+        for k in oldest:
+            ref.child(k).delete()
+
+
 def save_model_metrics(results, best_name):
 
     payload = {

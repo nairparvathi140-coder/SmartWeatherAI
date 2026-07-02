@@ -396,6 +396,17 @@ def select_best_model():
     )
 
     # -------------------------------------------------------
+    # SAVE ALL 4 TRAINED MODELS INDIVIDUALLY
+    # (used later by predict_with_all_models)
+    # -------------------------------------------------------
+
+    def _slug(name):
+        return name.lower().replace(" ", "_") + ".pkl"
+
+    for name, mdl in models.items():
+        joblib.dump(mdl, os.path.join(config.MODEL_FOLDER, _slug(name)))
+
+    # -------------------------------------------------------
     # FEATURE IMPORTANCE
     # (Tree Models Only)
     # -------------------------------------------------------

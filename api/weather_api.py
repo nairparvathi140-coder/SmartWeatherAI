@@ -16,11 +16,16 @@ import config
 # DOWNLOAD NASA WEATHER DATA
 # ===========================================================
 
-def download_weather_data():
+def download_weather_data(latitude=None, longitude=None):
 
     print("\n" + "=" * 60)
     print("DOWNLOADING NASA POWER DATA")
     print("=" * 60)
+
+    lat = latitude if latitude is not None else config.LATITUDE
+    lon = longitude if longitude is not None else config.LONGITUDE
+
+    print(f"Location : {lat:.4f}, {lon:.4f}")
 
     end_date = datetime.today()
 
@@ -37,9 +42,9 @@ def download_weather_data():
 
         "community": "RE",
 
-        "longitude": config.LONGITUDE,
+        "longitude": lon,
 
-        "latitude": config.LATITUDE,
+        "latitude": lat,
 
         "start": start,
 
