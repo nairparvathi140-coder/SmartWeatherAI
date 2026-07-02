@@ -228,7 +228,8 @@ def run_once():
 # MAIN LOOP
 # ===========================================================
 
-if __name__ == "__main__":
+def main_loop():
+    """Continuous loop — used locally and by the Cloud Run service."""
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
     print(f"config poll: {CONFIG_POLL_SECONDS}s · "
@@ -253,3 +254,7 @@ if __name__ == "__main__":
             print(f"ERROR: {e}")
 
         time.sleep(CONFIG_POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main_loop()

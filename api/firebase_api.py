@@ -1,3 +1,4 @@
+import os
 import firebase_admin
 from datetime import datetime
 from firebase_admin import credentials
@@ -7,25 +8,24 @@ import config
 
 # ==========================================================
 # INITIALIZE FIREBASE
+#   - Local dev: use serviceAccountKey.json if present.
+#   - Cloud Run: no key file — fall back to Application Default
+#     Credentials, i.e. the service the container runs as. This
+#     keeps secrets OUT of the image.
 # ==========================================================
 
 if not firebase_admin._apps:
 
-    cred = credentials.Certificate(
-        config.SERVICE_ACCOUNT_FILE
-    )
+    options = {"databaseURL": config.FIREBASE_DATABASE_URL}
 
-    firebase_admin.initialize_app(
+    if os.path.exists(config.SERVICE_ACCOUNT_FILE):
+        cred = credentials.Certificate(config.SERVICE_ACCOUNT_FILE)
+    else:
+        # ApplicationDefault() picks up the Cloud Run runtime service
+        # account automatically (no key material on disk).
+        cred = credentials.ApplicationDefault()
 
-        cred,
-
-        {
-
-            "databaseURL": config.FIREBASE_DATABASE_URL
-
-        }
-
-    )
+    firebase_admin.initialize_app(cred, options)
 
 # ==========================================================
 # READ VALUE

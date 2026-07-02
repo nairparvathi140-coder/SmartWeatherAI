@@ -14,5 +14,10 @@ COPY . .
 RUN mkdir -p data models logs
 
 ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
+EXPOSE 8080
 
-CMD ["python", "service_main.py"]
+# Runs the continuous pipeline loop in a background thread and serves a
+# health endpoint on $PORT (required by Cloud Run). Deploy as a Service
+# with --min-instances=1 so the loop is always alive.
+CMD ["python", "server.py"]
