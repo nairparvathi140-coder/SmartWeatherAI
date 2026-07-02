@@ -13,6 +13,35 @@ import config
 
 
 # ===========================================================
+# INPUT SANITIZATION (ML defense-in-depth)
+# ===========================================================
+# Even though the EMQX webhook validates physical bounds at ingest, the model
+# clamps its OWN inputs too. This stops a poisoned/faulty reading that somehow
+# reaches the pipeline (bypassed webhook, corrupt analytics node, sensor
+# fault) from driving the model to absurd extrapolations. NaN/inf → midpoint.
+
+_INPUT_BOUNDS = {
+    "temperature": (-60.0, 65.0, 20.0),
+    "humidity": (0.0, 100.0, 50.0),
+    "wind_speed": (0.0, 120.0, 0.0),
+    "rainfall": (0.0, 500.0, 0.0),
+    "irradiance": (0.0, 1500.0, 0.0),
+    "pressure_hpa": (800.0, 1100.0, 1013.0),
+}
+
+
+def _clamp(name, value):
+    lo, hi, default = _INPUT_BOUNDS[name]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if np.isnan(v) or np.isinf(v):
+        return default
+    return min(hi, max(lo, v))
+
+
+# ===========================================================
 # FEATURE VECTOR BUILDER (shared)
 # ===========================================================
 
@@ -20,16 +49,32 @@ def _build_features(
     temperature, humidity, wind_speed,
     wind_direction_degrees, rainfall, pressure, irradiance,
 ):
-    radians = np.deg2rad(wind_direction_degrees)
+    # Wind direction: wrap to [0,360) then encode; NaN → 0°.
+    try:
+        wd = float(wind_direction_degrees)
+        if np.isnan(wd) or np.isinf(wd):
+            wd = 0.0
+    except (TypeError, ValueError):
+        wd = 0.0
+    radians = np.deg2rad(wd % 360.0)
     wind_dir_sin = float(np.sin(radians))
     wind_dir_cos = float(np.cos(radians))
 
     # Pressure unit auto-detect: NASA training data is hPa (~850-1100).
     # Bresser/analytics feeds may report kPa (~85-110) or hPa directly.
-    if pressure < 200:
-        pressure_hpa = pressure * 10   # kPa → hPa
-    else:
-        pressure_hpa = pressure        # already hPa
+    try:
+        praw = float(pressure)
+    except (TypeError, ValueError):
+        praw = 1013.0
+    pressure_hpa = praw * 10 if praw < 200 else praw
+
+    # Clamp every model input to its physical range.
+    temperature = _clamp("temperature", temperature)
+    humidity = _clamp("humidity", humidity)
+    wind_speed = _clamp("wind_speed", wind_speed)
+    rainfall = _clamp("rainfall", rainfall)
+    irradiance = _clamp("irradiance", irradiance)
+    pressure_hpa = _clamp("pressure_hpa", pressure_hpa)
 
     # Named DataFrame so columns align with training exactly
     return pd.DataFrame(
