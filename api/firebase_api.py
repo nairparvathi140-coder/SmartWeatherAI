@@ -52,68 +52,36 @@ def read_value(path, default=0):
 # ==========================================================
 
 def get_live_sensor_data():
+    """Read the live Bresser reading from weather_station/payload — the same
+    node the dashboard uses — falling back to the legacy analytics/* paths
+    for any field the payload doesn't carry."""
 
-    sensor_data = {
+    payload = {}
+    try:
+        node = db.reference("weather_station").get() or {}
+        payload = node.get("payload", node) or {}
+    except Exception:
+        payload = {}
 
-        "temperature":
+    def pick(*keys, fallback_path=None):
+        for k in keys:
+            v = payload.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return read_value(fallback_path) if fallback_path else 0.0
 
-        read_value(
-
-            "analytics/daily/avg_temperature"
-
-        ),
-
-        "humidity":
-
-        read_value(
-
-            "analytics/daily/avg_humidity"
-
-        ),
-
-        "wind_speed":
-
-        read_value(
-
-            "analytics/wind/average_speed"
-
-        ),
-
-        "wind_direction":
-
-        read_value(
-
-            "analytics/wind/average_direction"
-
-        ),
-
-        "rainfall":
-
-        read_value(
-
-            "analytics/rainfall/rainfall_percentage"
-
-        ),
-
-        "pressure":
-
-        read_value(
-
-            "analytics/daily/avg_pressure"
-
-        ),
-
-        "irradiance":
-
-        read_value(
-
-            "analytics/light/avg_light"
-
-        )
-
+    return {
+        "temperature":    pick("temperature", fallback_path="analytics/daily/avg_temperature"),
+        "humidity":       pick("humidity", fallback_path="analytics/daily/avg_humidity"),
+        "wind_speed":     pick("wind_speed", "wind_avg_ms", fallback_path="analytics/wind/average_speed"),
+        "wind_direction": pick("wind_direction", "wind_dir", fallback_path="analytics/wind/average_direction"),
+        "rainfall":       pick("rain", "rainfall", fallback_path="analytics/rainfall/rainfall_percentage"),
+        "pressure":       pick("pressure", fallback_path="analytics/daily/avg_pressure"),
+        "irradiance":     pick("irradiance", "light", fallback_path="analytics/light/avg_light"),
     }
-
-    return sensor_data
 
 # ==========================================================
 # WRITE PREDICTIONS
