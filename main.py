@@ -191,7 +191,10 @@ def run_cycle(station):
 
     now = datetime.now()
     date, time = _slot(now)                          # current 20-min slot
-    tdate, ttime = _slot(now + timedelta(hours=1))   # slot the forecast targets
+    # Forecast the NEXT 20-min slot so validation closes every 20 min
+    # (matches the mentor's 20-min actual-vs-predicted cadence) instead of
+    # only once an hour.
+    tdate, ttime = _slot(now + timedelta(minutes=SLOT_MINUTES))
 
     # 1. Store the aggregated reading — nested sensor_history/{date}/{time}
     append_sensor_history(actual, date, time, samples=n)
