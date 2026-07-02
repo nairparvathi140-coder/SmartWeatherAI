@@ -101,30 +101,27 @@ def save_prediction(prediction):
 
 
 # ==========================================================
-# APPEND PREDICTION TO ROLLING HISTORY (for dashboard time-series)
+# NESTED PREDICTION HISTORY (date → time, for dashboard time-series)
 # ==========================================================
 
-def append_prediction_history(prediction, actual=None, max_entries=200):
+def append_prediction_history(prediction, actual=None, date=None, time=None):
 
     entry = {
         "timestamp": datetime.now().isoformat(),
         "predicted": prediction,
     }
-
     if actual is not None:
         entry["actual"] = actual
 
-    ref = db.reference("prediction_history")
-    ref.push(entry)
+    # Fall back to the current slot if the caller didn't pass one.
+    if date is None or time is None:
+        now = datetime.now()
+        minute = (now.minute // 20) * 20
+        date = now.strftime("%Y-%m-%d")
+        time = f"{now.hour:02d}:{minute:02d}"
 
-    all_entries = ref.get() or {}
-
-    if len(all_entries) > max_entries:
-
-        oldest_keys = sorted(all_entries.keys())[: len(all_entries) - max_entries]
-
-        for key in oldest_keys:
-            ref.child(key).delete()
+    db.reference(f"prediction_history/{date}/{time}").set(entry)
+    _trim_nested_dates("prediction_history")
 
 
 # ==========================================================
@@ -174,59 +171,68 @@ def set_pipeline_status(state, station=None):
         print(f"Warning: could not write pipeline status: {e}")
 
 
+SENSOR_FIELDS = [
+    "temperature", "humidity", "wind_speed", "wind_direction",
+    "rainfall", "pressure", "irradiance",
+]
+
+
+def _clean_reading(sensor):
+    return {k: round(float(sensor.get(k, 0)), 4) for k in SENSOR_FIELDS}
+
+
+def _trim_nested_dates(path, keep_days=14):
+    """Nested stores are {path}/{date}/{time}. Keep only the newest
+    `keep_days` date nodes so the tree can't grow without bound."""
+    ref = db.reference(path)
+    dates = ref.get(shallow=True) or {}
+    if len(dates) > keep_days:
+        for d in sorted(dates.keys())[: len(dates) - keep_days]:
+            ref.child(d).delete()
+
+
 # ==========================================================
-# HOURLY LIVE READING BUCKET (Bresser sensor data, cleaned)
+# NESTED SENSOR HISTORY  (date → time → reading, every 20 min)
 # ==========================================================
 
-def append_live_reading(sensor, hour_key):
-    """Overwrite live_readings/{hour_key} with a clean reading (no rssi/sensor_id)."""
-    clean = {k: sensor.get(k, 0) for k in [
-        "temperature", "humidity", "wind_speed", "wind_direction",
-        "rainfall", "pressure", "irradiance"
-    ]}
+def append_sensor_history(sensor, date, time):
+    """Store a clean reading at sensor_history/{date}/{time}.
+    The date→time nesting is what renders as a scroll-down tree in the
+    Firebase console. Overwriting the same (date,time) slot is idempotent."""
+    clean = _clean_reading(sensor)
     clean["timestamp"] = datetime.now().isoformat()
-    db.reference(f"live_readings/{hour_key}").set(clean)
+    db.reference(f"sensor_history/{date}/{time}").set(clean)
+    _trim_nested_dates("sensor_history")
 
 
 # ==========================================================
-# ALL-MODEL PREDICTIONS BUCKET (forecast for a target hour)
+# ALL-MODEL PREDICTIONS BUCKET (forecast for a target date/time slot)
 # ==========================================================
 
-def save_predictions_all_models(predictions_by_model, target_hour_key):
-    db.reference(f"predictions_all_models/{target_hour_key}").set({
-        "predicted_for": target_hour_key,
+def save_predictions_all_models(predictions_by_model, target_date, target_time):
+    db.reference(f"predictions_all_models/{target_date}/{target_time}").set({
+        "predicted_for": f"{target_date} {target_time}",
         "written_at": datetime.now().isoformat(),
         "predictions": predictions_by_model,
     })
 
 
-def get_predictions_all_models(hour_key):
-    return db.reference(f"predictions_all_models/{hour_key}").get()
+def get_predictions_all_models(date, time):
+    return db.reference(f"predictions_all_models/{date}/{time}").get()
 
 
 # ==========================================================
-# VALIDATION HISTORY — actual vs 4-model predictions per hour
+# NESTED VALIDATION HISTORY — actual vs 4-model predictions per slot
 # ==========================================================
 
-def save_validation_record(hour_key, actual, predictions_by_model):
-    clean_actual = {k: actual.get(k, 0) for k in [
-        "temperature", "humidity", "wind_speed", "wind_direction",
-        "rainfall", "pressure", "irradiance"
-    ]}
-    db.reference(f"validation_history/{hour_key}").set({
-        "hour": hour_key,
-        "actual": clean_actual,
+def save_validation_record(date, time, actual, predictions_by_model):
+    db.reference(f"validation_history/{date}/{time}").set({
+        "hour": f"{date} {time}",
+        "actual": _clean_reading(actual),
         "predictions": predictions_by_model,
     })
-
-
-def trim_validation_history(max_entries=200):
-    ref = db.reference("validation_history")
-    entries = ref.get() or {}
-    if len(entries) > max_entries:
-        oldest = sorted(entries.keys())[: len(entries) - max_entries]
-        for k in oldest:
-            ref.child(k).delete()
+    _trim_nested_dates("validation_history")
+    _trim_nested_dates("predictions_all_models")
 
 
 def save_model_metrics(results, best_name):

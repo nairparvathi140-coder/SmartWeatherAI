@@ -28,15 +28,13 @@ from training.model_selection import select_best_model
 from api.firebase_api import (
     get_live_sensor_data,
     save_prediction,
-    save_validation,
     append_prediction_history,
     get_station_config,
     set_station_config_defaults,
-    append_live_reading,
     save_predictions_all_models,
     get_predictions_all_models,
     save_validation_record,
-    trim_validation_history,
+    append_sensor_history,
     set_pipeline_status,
 )
 
@@ -49,15 +47,19 @@ from prediction.predict import (
 LAST_COORDS_FILE = "models/last_coords.json"
 
 CONFIG_POLL_SECONDS = 60          # how often we check for a location change
-PREDICTION_INTERVAL_SECONDS = 1800  # 30 min between prediction cycles
+STORE_INTERVAL_SECONDS = 1200     # 20 min — store readings + run a cycle
+SLOT_MINUTES = 20                 # nested time-slot grid (00, 20, 40)
 
 
 # ===========================================================
 # HELPERS
 # ===========================================================
 
-def _hour_key(dt):
-    return dt.strftime("%Y-%m-%dT%H")
+def _slot(dt):
+    """Return (date, time) for the nested RTDB store, snapped to the
+    20-min grid. e.g. 14:07 -> ('2026-07-02', '14:00'); 14:33 -> '14:20'."""
+    minute = (dt.minute // SLOT_MINUTES) * SLOT_MINUTES
+    return dt.strftime("%Y-%m-%d"), f"{dt.hour:02d}:{minute:02d}"
 
 
 def _load_last_coords():
@@ -173,48 +175,46 @@ def run_cycle(station):
     set_pipeline_status("running", station)
 
     now = datetime.now()
-    this_hour_key = _hour_key(now)
-    next_hour_key = _hour_key(now + timedelta(hours=1))
+    date, time = _slot(now)                          # current 20-min slot
+    tdate, ttime = _slot(now + timedelta(hours=1))   # slot the forecast targets
 
-    # 1. Store this hour's clean reading
-    append_live_reading(sensor, this_hour_key)
+    # 1. Store this slot's clean reading — nested sensor_history/{date}/{time}
+    append_sensor_history(sensor, date, time)
+    print(f"\nStored reading at sensor_history/{date}/{time}")
 
-    # 2. Forecast next hour with all 4 models
+    # 2. Forecast next hour with all 4 models, keyed to the target slot
     all_preds = predict_with_all_models(
         sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
         sensor["wind_direction"], sensor["rainfall"],
         sensor["pressure"], sensor["irradiance"],
     )
     if all_preds:
-        print("\nNEXT-HOUR PREDICTIONS BY MODEL")
+        print("NEXT-HOUR PREDICTIONS BY MODEL")
         for name, p in all_preds.items():
             print(f"  {name:20} temp={p['temperature']:.2f} hum={p['humidity']:.2f}")
-        save_predictions_all_models(all_preds, next_hour_key)
+        save_predictions_all_models(all_preds, tdate, ttime)
     else:
-        print("\n!! No per-model .pkl files found — retrain will fix this.")
+        print("!! No per-model .pkl files found — retrain will fix this.")
 
-    # 3. Close this hour's validation record
-    past = get_predictions_all_models(this_hour_key)
+    # 3. Close the validation record for THIS slot (prediction made ~1h ago)
+    past = get_predictions_all_models(date, time)
     if past and past.get("predictions"):
-        save_validation_record(this_hour_key, sensor, past["predictions"])
-        print(f"\nValidation record closed for {this_hour_key}")
+        save_validation_record(date, time, sensor, past["predictions"])
+        print(f"Validation record closed for {date} {time}")
     else:
-        print(f"\nNo prior prediction for {this_hour_key} — first cycle at this location.")
+        print(f"No prior prediction for {date} {time} — first cycle at this slot.")
 
-    trim_validation_history(200)
-
-    # 4. Legacy best-model writes (kept for backward compat)
+    # 4. Best-model next-hour forecast + nested prediction history
     prediction = predict_next_hour(
         sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
         sensor["wind_direction"], sensor["rainfall"],
         sensor["pressure"], sensor["irradiance"],
     )
     save_prediction(prediction)
-    save_validation(sensor, prediction)
-    append_prediction_history(prediction, actual=sensor)
+    append_prediction_history(prediction, actual=sensor, date=date, time=time)
 
     set_pipeline_status("idle", station)
-    print("\nCYCLE COMPLETE")
+    print("CYCLE COMPLETE")
 
 
 def run_once():
@@ -233,7 +233,7 @@ def main_loop():
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
     print(f"config poll: {CONFIG_POLL_SECONDS}s · "
-          f"prediction interval: {PREDICTION_INTERVAL_SECONDS // 60}min")
+          f"store interval: {STORE_INTERVAL_SECONDS // 60}min")
     print("=" * 60)
 
     last_cycle_at = 0.0
@@ -245,7 +245,7 @@ def main_loop():
             # React to a dashboard location change within one poll interval.
             retrained = ensure_trained(station)
 
-            due = (time.time() - last_cycle_at) >= PREDICTION_INTERVAL_SECONDS
+            due = (time.time() - last_cycle_at) >= STORE_INTERVAL_SECONDS
             if retrained or due:
                 run_cycle(station)
                 last_cycle_at = time.time()
