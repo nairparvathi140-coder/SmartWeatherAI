@@ -94,51 +94,37 @@ def select_best_model():
     # MODELS
     # -------------------------------------------------------
 
+    # LinearRegression / RandomForest / ExtraTrees natively handle
+    # multi-output targets in a single fit. Wrapping them in
+    # MultiOutputRegressor trained 8 separate copies of each model
+    # (one per target column) — ~8x slower for identical results.
+    # XGBoost stays wrapped: its native multi-output support varies
+    # by version, so the wrapper is the safe choice there.
     models = {
 
-        "Linear Regression":
+        "Linear Regression": LinearRegression(),
 
-        MultiOutputRegressor(
+        "Random Forest": RandomForestRegressor(
 
-            LinearRegression()
+            n_estimators=config.N_ESTIMATORS,
 
-        ),
+            random_state=config.RANDOM_STATE,
 
-        "Random Forest":
-
-        MultiOutputRegressor(
-
-            RandomForestRegressor(
-
-                n_estimators=config.N_ESTIMATORS,
-
-                random_state=config.RANDOM_STATE,
-
-                n_jobs=-1
-
-            )
+            n_jobs=-1
 
         ),
 
-        "Extra Trees":
+        "Extra Trees": ExtraTreesRegressor(
 
-        MultiOutputRegressor(
+            n_estimators=config.N_ESTIMATORS,
 
-            ExtraTreesRegressor(
+            random_state=config.RANDOM_STATE,
 
-                n_estimators=config.N_ESTIMATORS,
-
-                random_state=config.RANDOM_STATE,
-
-                n_jobs=-1
-
-            )
+            n_jobs=-1
 
         ),
 
-        "XGBoost":
-
-        MultiOutputRegressor(
+        "XGBoost": MultiOutputRegressor(
 
             XGBRegressor(
 
@@ -150,11 +136,15 @@ def select_best_model():
 
                 objective="reg:squarederror",
 
+                tree_method="hist",
+
                 random_state=config.RANDOM_STATE,
 
                 n_jobs=-1
 
-            )
+            ),
+
+            n_jobs=1
 
         )
 
@@ -413,7 +403,11 @@ def select_best_model():
 
     if best_name in ["Random Forest", "Extra Trees"]:
 
-        importance = best_model.estimators_[0].feature_importances_
+        importance = (
+            best_model.feature_importances_
+            if hasattr(best_model, "feature_importances_")
+            else best_model.estimators_[0].feature_importances_
+        )
 
         feature_df = pd.DataFrame({
 

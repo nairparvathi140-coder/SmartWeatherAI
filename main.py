@@ -17,7 +17,11 @@ from datetime import datetime, timedelta
 
 import config
 
-from api.weather_api import download_weather_data
+from api.weather_api import (
+    download_weather_data,
+    dataset_is_fresh,
+    mark_dataset_ready,
+)
 from preprocessing.preprocess import preprocess_dataset
 from training.model_selection import select_best_model
 
@@ -66,10 +70,14 @@ def _load_last_coords():
         return None
 
 
-def _save_last_coords(lat, lon):
+def _save_last_coords(lat, lon, config_updated_at=""):
     os.makedirs(os.path.dirname(LAST_COORDS_FILE), exist_ok=True)
     with open(LAST_COORDS_FILE, "w") as f:
-        json.dump({"latitude": lat, "longitude": lon}, f)
+        json.dump({
+            "latitude": lat,
+            "longitude": lon,
+            "config_updated_at": config_updated_at,
+        }, f)
 
 
 def _coords_changed(new_lat, new_lon, last):
@@ -79,6 +87,15 @@ def _coords_changed(new_lat, new_lon, last):
         abs(new_lat - last.get("latitude", 0)) > 1e-4 or
         abs(new_lon - last.get("longitude", 0)) > 1e-4
     )
+
+
+def _config_retriggered(station, last):
+    """True when the operator hit Save & Retrain again — even with the
+    exact same coordinates — since the last completed training."""
+    if last is None:
+        return True
+    new_stamp = station.get("updated_at", "")
+    return bool(new_stamp) and new_stamp != last.get("config_updated_at", "")
 
 
 def _sensor_feed_alive(sensor):
@@ -100,22 +117,35 @@ def resolve_station():
 
 
 def ensure_trained(station):
-    """Retrain the full NASA pipeline if coords changed or models are missing."""
+    """Retrain when coords changed, the operator re-triggered training,
+    or models are missing. Skips the NASA download when a fresh (<24h)
+    preprocessed dataset for the same coordinates is already on disk."""
     lat, lon = station["latitude"], station["longitude"]
     last = _load_last_coords()
     models_ok = os.path.exists(config.MODEL_PATH)
 
-    if not _coords_changed(lat, lon, last) and models_ok:
+    needs_training = (
+        _coords_changed(lat, lon, last)
+        or _config_retriggered(station, last)
+        or not models_ok
+    )
+    if not needs_training:
         return False
 
     print(f"\n>>> TRAINING for {station['place']} ({lat:.4f}, {lon:.4f})")
     set_pipeline_status("training", station)
+    t0 = time.time()
     try:
-        download_weather_data(latitude=lat, longitude=lon)
-        preprocess_dataset()
+        if dataset_is_fresh(lat, lon):
+            print("Dataset cache hit — skipping NASA download + preprocessing.")
+        else:
+            download_weather_data(latitude=lat, longitude=lon)
+            preprocess_dataset()
+            mark_dataset_ready(lat, lon)
         select_best_model()
-        _save_last_coords(lat, lon)
+        _save_last_coords(lat, lon, station.get("updated_at", ""))
         set_pipeline_status("idle", station)
+        print(f">>> Training finished in {time.time() - t0:.1f}s")
         return True
     except Exception:
         set_pipeline_status("error", station)

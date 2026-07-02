@@ -5,12 +5,53 @@ NASA POWER WEATHER DATA DOWNLOAD
 """
 
 import os
+import json
 import requests
 import pandas as pd
 
 from datetime import datetime, timedelta
 
 import config
+
+DATASET_META_PATH = os.path.join("data", "dataset_meta.json")
+CACHE_MAX_AGE_HOURS = 24
+
+
+def mark_dataset_ready(lat, lon):
+    """Record that the on-disk dataset is downloaded AND preprocessed
+    for these coordinates. Call only after preprocessing succeeds."""
+    os.makedirs("data", exist_ok=True)
+    with open(DATASET_META_PATH, "w") as f:
+        json.dump({
+            "latitude": lat,
+            "longitude": lon,
+            "downloaded_at": datetime.now().isoformat(),
+        }, f)
+
+
+def dataset_is_fresh(lat, lon):
+    """Public: dataset on disk is preprocessed, for these coords, < 24h old."""
+    return _cache_is_fresh(lat, lon)
+
+
+def _cache_is_fresh(lat, lon):
+    """True when the dataset on disk is for these coords and < 24h old."""
+    if not (os.path.exists(DATASET_META_PATH) and os.path.exists(config.DATASET_PATH)):
+        return False
+    try:
+        with open(DATASET_META_PATH) as f:
+            meta = json.load(f)
+        same_coords = (
+            abs(meta["latitude"] - lat) < 1e-4 and
+            abs(meta["longitude"] - lon) < 1e-4
+        )
+        age_hours = (
+            datetime.now() - datetime.fromisoformat(meta["downloaded_at"])
+        ).total_seconds() / 3600
+        return same_coords and age_hours < CACHE_MAX_AGE_HOURS
+    except Exception:
+        return False
+
 
 # ===========================================================
 # DOWNLOAD NASA WEATHER DATA
@@ -26,6 +67,7 @@ def download_weather_data(latitude=None, longitude=None):
     lon = longitude if longitude is not None else config.LONGITUDE
 
     print(f"Location : {lat:.4f}, {lon:.4f}")
+
 
     end_date = datetime.today()
 
