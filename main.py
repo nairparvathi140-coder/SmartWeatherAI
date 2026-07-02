@@ -85,7 +85,20 @@ def _save_last_coords(lat, lon, config_updated_at=""):
             "latitude": lat,
             "longitude": lon,
             "config_updated_at": config_updated_at,
+            "trained_at": datetime.now().isoformat(),
         }, f)
+
+
+def _model_is_stale(last):
+    """True when the model is older than config.RETRAIN_INTERVAL_DAYS —
+    triggers the scheduled weekly retrain on the same coordinates."""
+    if not last or not last.get("trained_at"):
+        return False
+    try:
+        trained = datetime.fromisoformat(last["trained_at"])
+    except (ValueError, TypeError):
+        return False
+    return (datetime.now() - trained) > timedelta(days=config.RETRAIN_INTERVAL_DAYS)
 
 
 def _coords_changed(new_lat, new_lon, last):
@@ -132,13 +145,18 @@ def ensure_trained(station):
     last = _load_last_coords()
     models_ok = os.path.exists(config.MODEL_PATH)
 
+    stale = _model_is_stale(last)
     needs_training = (
         _coords_changed(lat, lon, last)
         or _config_retriggered(station, last)
         or not models_ok
+        or stale
     )
     if not needs_training:
         return False
+    if stale:
+        print(f">>> Scheduled weekly retrain (model older than "
+              f"{config.RETRAIN_INTERVAL_DAYS} days)")
 
     print(f"\n>>> TRAINING for {station['place']} ({lat:.4f}, {lon:.4f})")
     set_pipeline_status("training", station)
