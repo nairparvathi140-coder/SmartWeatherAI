@@ -6,11 +6,17 @@ Actual vs Predicted Weather Parameters
 ===========================================================
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import firebase_admin
 import matplotlib.pyplot as plt
 
 from firebase_admin import credentials
 from firebase_admin import db
+
+import config
 
 
 # ===========================================================
@@ -20,7 +26,7 @@ from firebase_admin import db
 if not firebase_admin._apps:
 
     cred = credentials.Certificate(
-        "serviceAccountKey.json"
+        config.SERVICE_ACCOUNT_FILE
     )
 
     firebase_admin.initialize_app(
@@ -29,8 +35,7 @@ if not firebase_admin._apps:
 
         {
 
-            "databaseURL":
-            "https://weather-app-2-920f0-default-rtdb.firebaseio.com/"
+            "databaseURL": config.FIREBASE_DATABASE_URL
 
         }
 

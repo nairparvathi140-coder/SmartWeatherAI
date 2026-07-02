@@ -131,7 +131,18 @@ TARGET_COLUMNS = [
 # FIREBASE
 # ===========================================================
 
-SERVICE_ACCOUNT_FILE = "serviceAccountKey.json"
+import os
+
+SERVICE_ACCOUNT_FILE = os.environ.get(
+    "FIREBASE_SERVICE_ACCOUNT",
+    "serviceAccountKey.json"
+)
+
+# Must match the project the LogiXair dashboard uses.
+FIREBASE_DATABASE_URL = os.environ.get(
+    "FIREBASE_DATABASE_URL",
+    "https://weather-station-orpl-default-rtdb.asia-southeast1.firebasedatabase.app"
+)
 
 # ===========================================================
 # PREDICTION
