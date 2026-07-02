@@ -1,15 +1,15 @@
 """
-Cloud Run Job entrypoint — runs one prediction cycle and exits.
+Cloud Run Job entrypoint — resolves station config, retrains if the
+location changed, runs one prediction/validation cycle, and exits.
 
-Cloud Scheduler triggers this every N minutes.
+Cloud Scheduler triggers this every 30 minutes.
 """
-import os
 import sys
-from main import main
+from main import run_once
 
 if __name__ == "__main__":
     try:
-        main()
+        run_once()
         sys.exit(0)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

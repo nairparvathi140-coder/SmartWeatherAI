@@ -1,10 +1,12 @@
 """
 ===========================================================
 SMART WEATHER AI — MAIN LOOP
-Reads station config (lat/lon/place) from Firebase.
-Retrains NASA pipeline when coordinates change.
-Every cycle: writes clean live reading, forecasts with all
-4 models, and closes previous hour's validation record.
+- Polls /station/config every CONFIG_POLL_SECONDS.
+- Retrains IMMEDIATELY when the operator changes location
+  from the dashboard (new NASA 2-year download for the new
+  coordinates).
+- Runs a prediction/validation cycle every
+  PREDICTION_INTERVAL_SECONDS using live Bresser readings.
 ===========================================================
 """
 
@@ -31,6 +33,7 @@ from api.firebase_api import (
     get_predictions_all_models,
     save_validation_record,
     trim_validation_history,
+    set_pipeline_status,
 )
 
 from prediction.predict import (
@@ -41,6 +44,13 @@ from prediction.predict import (
 
 LAST_COORDS_FILE = "models/last_coords.json"
 
+CONFIG_POLL_SECONDS = 60          # how often we check for a location change
+PREDICTION_INTERVAL_SECONDS = 1800  # 30 min between prediction cycles
+
+
+# ===========================================================
+# HELPERS
+# ===========================================================
 
 def _hour_key(dt):
     return dt.strftime("%Y-%m-%dT%H")
@@ -71,97 +81,99 @@ def _coords_changed(new_lat, new_lon, last):
     )
 
 
-def _run_training(lat, lon):
-    print(f"\n>>> Training pipeline for {lat:.4f}, {lon:.4f}")
-    download_weather_data(latitude=lat, longitude=lon)
-    preprocess_dataset()
-    select_best_model()
-    _save_last_coords(lat, lon)
+def _sensor_feed_alive(sensor):
+    """False when every reading is exactly 0 — Bresser feed dead or paths wrong."""
+    return any(abs(float(v)) > 1e-9 for v in sensor.values())
 
 
-def main():
-    print("=" * 60)
-    print("SMART WEATHER AI")
-    print("=" * 60)
-
-    # -----------------------------------------------------------
-    # 1. RESOLVE STATION LOCATION
-    # -----------------------------------------------------------
+def resolve_station():
+    """Read station config from Firebase, seeding a default on first boot."""
     set_station_config_defaults(config.LATITUDE, config.LONGITUDE, "Bengaluru")
-
     station = get_station_config() or {
         "latitude": config.LATITUDE,
         "longitude": config.LONGITUDE,
         "place": "default",
     }
-    lat = station["latitude"]
-    lon = station["longitude"]
-    place = station["place"]
-    print(f"\nStation: {place} ({lat:.4f}, {lon:.4f})")
+    config.LATITUDE = station["latitude"]
+    config.LONGITUDE = station["longitude"]
+    return station
 
-    # -----------------------------------------------------------
-    # Sync in-memory config so downstream modules pick up the value
-    # -----------------------------------------------------------
-    config.LATITUDE = lat
-    config.LONGITUDE = lon
 
-    # -----------------------------------------------------------
-    # 2. RE-TRAIN IF COORDS CHANGED OR MODELS MISSING
-    # -----------------------------------------------------------
+def ensure_trained(station):
+    """Retrain the full NASA pipeline if coords changed or models are missing."""
+    lat, lon = station["latitude"], station["longitude"]
     last = _load_last_coords()
     models_ok = os.path.exists(config.MODEL_PATH)
-    if _coords_changed(lat, lon, last) or not models_ok:
-        _run_training(lat, lon)
-    else:
-        print("Models already trained for these coordinates. Skipping training.")
 
-    # -----------------------------------------------------------
-    # 3. READ LIVE SENSOR DATA
-    # -----------------------------------------------------------
+    if not _coords_changed(lat, lon, last) and models_ok:
+        return False
+
+    print(f"\n>>> TRAINING for {station['place']} ({lat:.4f}, {lon:.4f})")
+    set_pipeline_status("training", station)
+    try:
+        download_weather_data(latitude=lat, longitude=lon)
+        preprocess_dataset()
+        select_best_model()
+        _save_last_coords(lat, lon)
+        set_pipeline_status("idle", station)
+        return True
+    except Exception:
+        set_pipeline_status("error", station)
+        raise
+
+
+def run_cycle(station):
+    """One prediction + validation cycle against live Bresser data."""
+    print("\n" + "=" * 60)
+    print(f"PREDICTION CYCLE — {station['place']} "
+          f"({station['latitude']:.4f}, {station['longitude']:.4f})")
+    print("=" * 60)
+
     sensor = get_live_sensor_data()
     print("\nLIVE SENSOR DATA")
     for key, value in sensor.items():
         print(f"  {key:15}: {value}")
 
+    if not _sensor_feed_alive(sensor):
+        print("\n!! All sensor readings are zero — Bresser feed appears dead.")
+        print("   Skipping cycle so validation history stays clean.")
+        set_pipeline_status("no_sensor_data", station)
+        return
+
+    set_pipeline_status("running", station)
+
     now = datetime.now()
     this_hour_key = _hour_key(now)
     next_hour_key = _hour_key(now + timedelta(hours=1))
 
-    # -----------------------------------------------------------
-    # 4. STORE CLEAN LIVE READING FOR THIS HOUR
-    # -----------------------------------------------------------
+    # 1. Store this hour's clean reading
     append_live_reading(sensor, this_hour_key)
 
-    # -----------------------------------------------------------
-    # 5. PREDICT NEXT HOUR — ALL 4 MODELS
-    # -----------------------------------------------------------
+    # 2. Forecast next hour with all 4 models
     all_preds = predict_with_all_models(
         sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
         sensor["wind_direction"], sensor["rainfall"],
         sensor["pressure"], sensor["irradiance"],
     )
-    print("\nNEXT-HOUR PREDICTIONS BY MODEL")
-    for name, p in all_preds.items():
-        print(f"  {name:20} temp={p['temperature']:.2f} hum={p['humidity']:.2f}")
-
-    save_predictions_all_models(all_preds, next_hour_key)
-
-    # -----------------------------------------------------------
-    # 6. CLOSE THIS HOUR'S VALIDATION RECORD
-    #    (this hour's actual  ↔  prediction written last hour)
-    # -----------------------------------------------------------
-    past_predictions = get_predictions_all_models(this_hour_key)
-    if past_predictions and past_predictions.get("predictions"):
-        save_validation_record(this_hour_key, sensor, past_predictions["predictions"])
-        print(f"\nValidation record closed for hour {this_hour_key}")
+    if all_preds:
+        print("\nNEXT-HOUR PREDICTIONS BY MODEL")
+        for name, p in all_preds.items():
+            print(f"  {name:20} temp={p['temperature']:.2f} hum={p['humidity']:.2f}")
+        save_predictions_all_models(all_preds, next_hour_key)
     else:
-        print(f"\nNo prior prediction for {this_hour_key} — first cycle.")
+        print("\n!! No per-model .pkl files found — retrain will fix this.")
+
+    # 3. Close this hour's validation record
+    past = get_predictions_all_models(this_hour_key)
+    if past and past.get("predictions"):
+        save_validation_record(this_hour_key, sensor, past["predictions"])
+        print(f"\nValidation record closed for {this_hour_key}")
+    else:
+        print(f"\nNo prior prediction for {this_hour_key} — first cycle at this location.")
 
     trim_validation_history(200)
 
-    # -----------------------------------------------------------
-    # 7. LEGACY WRITES (best-model prediction + history)
-    # -----------------------------------------------------------
+    # 4. Legacy best-model writes (kept for backward compat)
     prediction = predict_next_hour(
         sensor["temperature"], sensor["humidity"], sensor["wind_speed"],
         sensor["wind_direction"], sensor["rainfall"],
@@ -171,18 +183,43 @@ def main():
     save_validation(sensor, prediction)
     append_prediction_history(prediction, actual=sensor)
 
+    set_pipeline_status("idle", station)
     print("\nCYCLE COMPLETE")
 
 
+def run_once():
+    """Single-shot entrypoint (Cloud Run Jobs)."""
+    station = resolve_station()
+    ensure_trained(station)
+    run_cycle(station)
+
+
 # ===========================================================
+# MAIN LOOP
+# ===========================================================
+
 if __name__ == "__main__":
-    SLEEP_SECONDS = 1800  # 30 min
+    print("=" * 60)
+    print("SMART WEATHER AI — service starting")
+    print(f"config poll: {CONFIG_POLL_SECONDS}s · "
+          f"prediction interval: {PREDICTION_INTERVAL_SECONDS // 60}min")
+    print("=" * 60)
+
+    last_cycle_at = 0.0
 
     while True:
         try:
-            main()
+            station = resolve_station()
+
+            # React to a dashboard location change within one poll interval.
+            retrained = ensure_trained(station)
+
+            due = (time.time() - last_cycle_at) >= PREDICTION_INTERVAL_SECONDS
+            if retrained or due:
+                run_cycle(station)
+                last_cycle_at = time.time()
+
         except Exception as e:
             print(f"ERROR: {e}")
 
-        print(f"\nSleeping {SLEEP_SECONDS // 60} min…\n")
-        time.sleep(SLEEP_SECONDS)
+        time.sleep(CONFIG_POLL_SECONDS)

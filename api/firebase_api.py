@@ -187,6 +187,26 @@ def set_station_config_defaults(latitude, longitude, place="Default"):
 
 
 # ==========================================================
+# PIPELINE STATUS — lets the dashboard show training progress
+# ==========================================================
+
+def set_pipeline_status(state, station=None):
+    """state: idle | training | running | no_sensor_data | error"""
+    payload = {
+        "state": state,
+        "updated_at": datetime.now().isoformat(),
+    }
+    if station:
+        payload["place"] = station.get("place", "")
+        payload["latitude"] = station.get("latitude", 0)
+        payload["longitude"] = station.get("longitude", 0)
+    try:
+        db.reference("station/status").set(payload)
+    except Exception as e:
+        print(f"Warning: could not write pipeline status: {e}")
+
+
+# ==========================================================
 # HOURLY LIVE READING BUCKET (Bresser sensor data, cleaned)
 # ==========================================================
 
