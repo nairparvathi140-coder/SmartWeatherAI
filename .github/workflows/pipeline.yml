@@ -1,0 +1,56 @@
+name: SmartWeatherAI Pipeline
+
+# Runs the prediction/validation pipeline 24/7 in GitHub's cloud — no Cloud
+# Run, no billing. Public repo ⇒ free unlimited minutes.
+on:
+  schedule:
+    # Every 20 minutes (GitHub cron is best-effort; may drift a few minutes).
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+# Prevent overlapping runs (a slow run won't collide with the next schedule).
+concurrency:
+  group: swai-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Reuse the trained model + NASA dataset across runs so we don't
+      # re-download/retrain every 20 min. ensure_trained() still retrains
+      # automatically when the dashboard changes the coordinates.
+      - name: Restore model + dataset cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data
+            models
+          key: swai-cache-${{ github.run_id }}
+          restore-keys: |
+            swai-cache-
+
+      # Write the service-account key from the encrypted secret. Passed via env
+      # (not the command line) so it never appears in logs.
+      - name: Write Firebase service account
+        env:
+          SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: printf '%s' "$SA_JSON" > serviceAccountKey.json
+
+      - name: Run one pipeline cycle
+        env:
+          FIREBASE_DATABASE_URL: https://weather-station-orpl-default-rtdb.asia-southeast1.firebasedatabase.app
+        run: python service_main.py
