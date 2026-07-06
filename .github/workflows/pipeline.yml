@@ -18,11 +18,12 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch: {}   # manual "Run workflow" button
 
-# One loop at a time. A fresh restart cancels the previous (near-expired) job so
-# there's a clean handoff instead of two loops writing at once.
+# One loop at a time. Queue (don't cancel) so a finishing run saves its model
+# cache cleanly before the next chained run starts; the concurrency group keeps
+# at most one running + one pending, so runs can never pile up.
 concurrency:
   group: swai-pipeline
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-cycle:
@@ -66,6 +67,18 @@ jobs:
       - name: Run the continuous prediction loop
         env:
           FIREBASE_DATABASE_URL: https://weather-station-orpl-default-rtdb.asia-southeast1.firebasedatabase.app
-          # Exit cleanly at 5h50m so the 6h schedule can relaunch a fresh loop.
+          # Exit cleanly at 5h50m, before GitHub's 6h job cap, so the next run
+          # can chain on. The self-dispatch step below relaunches it.
           MAX_RUNTIME_SECONDS: "21000"
         run: python main.py
+
+      # Perpetual cycle: when the loop finishes its window cleanly, trigger the
+      # next run ourselves — no dependence on GitHub's best-effort cron. Needs a
+      # PAT (the default GITHUB_TOKEN can't start new workflow runs). If the loop
+      # ever crashes instead of exiting cleanly, this step is skipped and the
+      # every-6h `schedule` above acts as the safety-net restart.
+      - name: Relaunch the loop (self-sustaining chain)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_PAT }}
+        run: gh workflow run pipeline.yml --repo "${{ github.repository }}" --ref main
