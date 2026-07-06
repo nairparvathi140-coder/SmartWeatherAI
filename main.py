@@ -38,6 +38,9 @@ from api.firebase_api import (
     append_hourly_trend,
     update_rolling_aggregates,
     set_pipeline_status,
+    place_key,
+    register_place,
+    archive_reading,
 )
 
 import recorder
@@ -215,9 +218,16 @@ def run_cycle(station):
     # only once an hour.
     tdate, ttime = _slot(now + timedelta(minutes=SLOT_MINUTES))
 
+    # Per-place archive: register the place and tag this reading to it so the
+    # dashboard can export CSVs by place + date.
+    pk = place_key(station["latitude"], station["longitude"])
+    register_place(pk, station.get("place", ""), station["latitude"], station["longitude"])
+
     # 1. Store the aggregated reading — nested sensor_history/{date}/{time}
     append_sensor_history(actual, date, time, samples=n)
-    print(f"Stored reading at sensor_history/{date}/{time}")
+    archive_reading(pk, "readings", date, time,
+                    {**actual, "samples": n, "timestamp": now.isoformat()})
+    print(f"Stored reading at sensor_history/{date}/{time} (place {pk})")
 
     # 2. Forecast next hour with all 4 models, keyed to the target slot
     all_preds = predict_with_all_models(
@@ -234,6 +244,9 @@ def run_cycle(station):
     past = get_predictions_all_models(date, time)
     if past and past.get("predictions"):
         save_validation_record(date, time, actual, past["predictions"])
+        archive_reading(pk, "validation", date, time,
+                        {"actual": actual, "predictions": past["predictions"],
+                         "timestamp": now.isoformat()})
         print(f"Validation record closed for {date} {time}")
     else:
         print(f"No prior prediction for {date} {time} — first cycle at this slot.")
@@ -272,6 +285,14 @@ def run_hourly(station):
         pass
 
     append_hourly_trend(actual, date, hour, samples=n, predicted=prediction)
+
+    # Per-place hourly archive for CSV export.
+    pk = place_key(station["latitude"], station["longitude"])
+    register_place(pk, station.get("place", ""), station["latitude"], station["longitude"])
+    archive_reading(pk, "hourly", date, hour,
+                    {**actual, "samples": n, "predicted": prediction,
+                     "timestamp": now.isoformat()})
+
     recorder.write_result("hourly", actual, prediction)
     print(f"Hourly trend stored at hourly_trend/{date}/{hour} ({n} samples)")
 

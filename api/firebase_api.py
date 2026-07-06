@@ -192,6 +192,37 @@ def _trim_nested_dates(path, keep_days=14):
 
 
 # ==========================================================
+# PER-PLACE ARCHIVE + PLACES REGISTRY (for CSV export by place/date)
+# ==========================================================
+
+def place_key(lat, lon):
+    """Stable, RTDB-key-safe id per location (~11 m). e.g. 12.9716, 77.5946
+    -> '12_9716_77_5946'. Negative coords use 'm' for the minus sign."""
+    return (f"{float(lat):.4f}_{float(lon):.4f}"
+            .replace(".", "_").replace("-", "m"))
+
+
+def register_place(pk, place, lat, lon):
+    """Record the human place name + coords for a place key, so exports can
+    name files by place and the dashboard can list available places."""
+    db.reference(f"places/{pk}").update({
+        "place": place or f"{float(lat):.4f},{float(lon):.4f}",
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "last_seen": datetime.now().isoformat(),
+    })
+
+
+def archive_reading(pk, kind, date, time, data):
+    """Persist a place-tagged copy for CSV export.
+    kind ∈ {'readings','hourly','validation'} →
+        archive/{pk}/{kind}/{date}/{time}.
+    Separate from the live sensor_history so changing coordinates keeps each
+    location's history cleanly isolated."""
+    db.reference(f"archive/{pk}/{kind}/{date}/{time}").set(data)
+
+
+# ==========================================================
 # NESTED SENSOR HISTORY  (date → time → reading, every 20 min)
 # ==========================================================
 
