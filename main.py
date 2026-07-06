@@ -54,7 +54,7 @@ from prediction.predict import (
 LAST_COORDS_FILE = "models/last_coords.json"
 
 CONFIG_POLL_SECONDS = 60          # how often we check for a location change
-SAMPLE_INTERVAL_SECONDS = 600     # 10 min — sample a reading into the excel
+SAMPLE_INTERVAL_SECONDS = 300     # 5 min — sample a reading into the excel
 STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store
 HOURLY_INTERVAL_SECONDS = 3600    # 60 min — aggregate the hour + store trend
 SLOT_MINUTES = 20                 # nested time-slot grid (00, 20, 40)
@@ -326,13 +326,20 @@ def run_once():
 # MAIN LOOP
 # ===========================================================
 
-def main_loop():
-    """Continuous loop — used locally and by the Cloud Run service.
+def main_loop(max_runtime_seconds=None):
+    """Continuous loop — used locally, by the Cloud Run service, and by the
+    GitHub Actions runner.
 
     Three cadences off one 60s poll:
       • sample the excel every 10 min
       • aggregate + validate + store every 20 min
       • aggregate the hour + store the trend every 60 min
+
+    When max_runtime_seconds is set (GitHub Actions caps a single job at 6h),
+    the loop exits cleanly with status 0 after that budget so a scheduled
+    restart can take over. All durable state (predictions awaiting validation,
+    nested history) already lives in RTDB, so the handoff is seamless — the
+    next run retrains only if the coordinates changed and continues the cycle.
     """
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
@@ -340,6 +347,7 @@ def main_loop():
           f"· cycle {STORE_INTERVAL_SECONDS // 60}min · hourly {HOURLY_INTERVAL_SECONDS // 60}min")
     print("=" * 60)
 
+    started_at = time.time()
     last_sample_at = 0.0
     last_cycle_at = 0.0
     last_hourly_at = 0.0
@@ -369,8 +377,17 @@ def main_loop():
         except Exception as e:
             print(f"ERROR: {e}")
 
+        if max_runtime_seconds and (time.time() - started_at) >= max_runtime_seconds:
+            print(f">>> Reached max runtime ({max_runtime_seconds}s) — exiting "
+                  f"cleanly for the scheduled restart.")
+            return
+
         time.sleep(CONFIG_POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    main_loop()
+    # On GitHub Actions we pass MAX_RUNTIME_SECONDS so the loop exits before the
+    # 6h job cap and the schedule restarts it. Locally it stays unset → runs
+    # forever, exactly as before.
+    _budget = int(os.environ.get("MAX_RUNTIME_SECONDS", "0")) or None
+    main_loop(max_runtime_seconds=_budget)

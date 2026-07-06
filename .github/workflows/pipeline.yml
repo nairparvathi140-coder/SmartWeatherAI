@@ -1,22 +1,35 @@
 name: SmartWeatherAI Pipeline
 
-# Runs the prediction/validation pipeline 24/7 in GitHub's cloud — no Cloud
-# Run, no billing. Public repo ⇒ free unlimited minutes.
+# Runs the SAME continuous loop we run locally (main.py → main_loop), 24/7 in
+# GitHub's cloud — no Cloud Run, no billing. Public repo ⇒ free unlimited
+# minutes. The loop samples the "excel" every 10 min, stores the 20-min
+# actual-vs-predicted cycle to RTDB, and aggregates the hourly trend — exactly
+# like local. GitHub caps a single job at 6h, so the loop exits cleanly at
+# ~5h50m (MAX_RUNTIME_SECONDS) and the schedule restarts it; durable state
+# lives in RTDB, so the handoff is seamless.
 on:
+  # Start the loop the moment this lands on main — no waiting for the first
+  # cron tick, and no PAT needed to bootstrap.
+  push:
+    branches: [ main ]
   schedule:
-    # Every 20 minutes (GitHub cron is best-effort; may drift a few minutes).
-    - cron: "*/20 * * * *"
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+    # Restart the loop every 6h (GitHub cron is best-effort; a few min drift is
+    # fine — the loop is what runs continuously, cron only re-launches it).
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button
 
-# Prevent overlapping runs (a slow run won't collide with the next schedule).
+# One loop at a time. A fresh restart cancels the previous (near-expired) job so
+# there's a clean handoff instead of two loops writing at once.
 concurrency:
   group: swai-pipeline
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Safety ceiling just under GitHub's 6h hard cap; the loop itself exits
+    # earlier via MAX_RUNTIME_SECONDS with a clean (green) status.
+    timeout-minutes: 355
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,8 +43,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Reuse the trained model + NASA dataset across runs so we don't
-      # re-download/retrain every 20 min. ensure_trained() still retrains
+      # Reuse the trained model + NASA dataset across restarts so we don't
+      # re-download/retrain on every launch. ensure_trained() still retrains
       # automatically when the dashboard changes the coordinates.
       - name: Restore model + dataset cache
         uses: actions/cache@v4
@@ -50,7 +63,9 @@ jobs:
           SA_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: printf '%s' "$SA_JSON" > serviceAccountKey.json
 
-      - name: Run one pipeline cycle
+      - name: Run the continuous prediction loop
         env:
           FIREBASE_DATABASE_URL: https://weather-station-orpl-default-rtdb.asia-southeast1.firebasedatabase.app
-        run: python service_main.py
+          # Exit cleanly at 5h50m so the 6h schedule can relaunch a fresh loop.
+          MAX_RUNTIME_SECONDS: "21000"
+        run: python main.py
