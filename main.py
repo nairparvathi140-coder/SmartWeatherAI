@@ -15,6 +15,15 @@ import time
 import json
 from datetime import datetime, timedelta
 
+# Force Indian Standard Time BEFORE any datetime.now() runs. GitHub Actions
+# runs in UTC, which would store a 14:00 IST reading as 08:30 UTC — the wrong
+# slot. Setting TZ + tzset makes every naive datetime.now() (slots, timestamps,
+# CSV rows, in main.py / firebase_api.py / recorder.py) use the station's local
+# clock. IST has no daylight saving, so this is exact year-round.
+os.environ["TZ"] = "Asia/Kolkata"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import config
 
 from api.weather_api import (
