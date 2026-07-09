@@ -66,8 +66,7 @@ LAST_COORDS_FILE = "models/last_coords.json"
 CONFIG_POLL_SECONDS = 60          # how often we check for a location change
 STALE_FEED_SECONDS = 900          # 15 min — no packet ⇒ station disconnected
 SAMPLE_INTERVAL_SECONDS = 300     # 5 min — sample a reading into the excel
-STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store
-HOURLY_INTERVAL_SECONDS = 3600    # 60 min — aggregate the hour + store trend
+STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store + refresh the hourly bucket
 SLOT_MINUTES = 20                 # nested time-slot grid (00, 20, 40)
 
 
@@ -295,7 +294,10 @@ def run_cycle(station):
 
 
 def run_hourly(station):
-    """Hourly: aggregate the last hour's excel → hourly_trend (nested)."""
+    """Refresh the CURRENT real clock hour's trailing-60-min aggregate.
+    Called every 20-min cycle (not on its own timer) so the bucket for
+    hour "15:00" always exists within 20 min of the station being live at
+    that hour — see main_loop() for why a separate timer was unreliable."""
     actual, n = recorder.aggregate(60)
     if actual is None:
         return
@@ -360,10 +362,19 @@ def main_loop(max_runtime_seconds=None):
     """Continuous loop — used locally, by the Cloud Run service, and by the
     GitHub Actions runner.
 
-    Three cadences off one 60s poll:
+    Two cadences off one 60s poll:
       • sample the excel every 10 min
-      • aggregate + validate + store every 20 min
-      • aggregate the hour + store the trend every 60 min
+      • aggregate + validate + store every 20 min — run_hourly() is called
+        in the SAME tick, refreshing the current real clock hour's bucket
+        (e.g. "15:00") with the trailing 60-min aggregate. Firing it off a
+        real clock-hour-aligned event (not a standalone 3600s timer) matters
+        because this loop restarts often (every ~6h automatically, and on
+        every redeploy) — a timer seeded at 0 fires once immediately on
+        startup then drifts +3600s from THAT moment, never landing on real
+        :00 boundaries. Piggy-backing on the 20-min cycle is restart-safe:
+        each restart still lands on a real 20-min slot, and hourly_trend for
+        the current hour is refreshed up to 3 times before the hour rolls
+        over, converging to a near-complete hourly average.
 
     When max_runtime_seconds is set (GitHub Actions caps a single job at 6h),
     the loop exits cleanly with status 0 after that budget so a scheduled
@@ -374,13 +385,12 @@ def main_loop(max_runtime_seconds=None):
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
     print(f"poll {CONFIG_POLL_SECONDS}s · sample {SAMPLE_INTERVAL_SECONDS // 60}min "
-          f"· cycle {STORE_INTERVAL_SECONDS // 60}min · hourly {HOURLY_INTERVAL_SECONDS // 60}min")
+          f"· cycle+hourly {STORE_INTERVAL_SECONDS // 60}min")
     print("=" * 60)
 
     started_at = time.time()
     last_sample_at = 0.0
     last_cycle_at = 0.0
-    last_hourly_at = 0.0
 
     while True:
         try:
@@ -398,11 +408,8 @@ def main_loop(max_runtime_seconds=None):
 
             if retrained or (now - last_cycle_at) >= STORE_INTERVAL_SECONDS:
                 run_cycle(station)
-                last_cycle_at = now
-
-            if (now - last_hourly_at) >= HOURLY_INTERVAL_SECONDS:
                 run_hourly(station)
-                last_hourly_at = now
+                last_cycle_at = now
 
         except Exception as e:
             print(f"ERROR: {e}")
