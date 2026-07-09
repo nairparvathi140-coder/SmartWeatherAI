@@ -41,6 +41,7 @@ from api.firebase_api import (
     place_key,
     register_place,
     archive_reading,
+    feed_age_seconds,
 )
 
 import recorder
@@ -54,6 +55,7 @@ from prediction.predict import (
 LAST_COORDS_FILE = "models/last_coords.json"
 
 CONFIG_POLL_SECONDS = 60          # how often we check for a location change
+STALE_FEED_SECONDS = 900          # 15 min — no packet ⇒ station disconnected
 SAMPLE_INTERVAL_SECONDS = 300     # 5 min — sample a reading into the excel
 STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store
 HOURLY_INTERVAL_SECONDS = 3600    # 60 min — aggregate the hour + store trend
@@ -127,6 +129,23 @@ def _sensor_feed_alive(sensor):
     return any(abs(float(v)) > 1e-9 for v in sensor.values())
 
 
+def _feed_is_live(sensor):
+    """A reading is only 'live' if it is non-zero AND the webhook received a
+    packet recently. Without the freshness check the pipeline would keep
+    re-storing the last known value forever after the station disconnects,
+    making it look like readings are still arriving."""
+    if not _sensor_feed_alive(sensor):
+        return False
+    age = feed_age_seconds()
+    if age is None:
+        return False                       # never received a packet
+    if age > STALE_FEED_SECONDS:
+        print(f"   Station feed is stale ({int(age)}s since last packet) — "
+              f"treating as disconnected.")
+        return False
+    return True
+
+
 def resolve_station():
     """Read station config from Firebase, seeding a default on first boot."""
     set_station_config_defaults(config.LATITUDE, config.LONGITUDE, "Bengaluru")
@@ -187,7 +206,7 @@ def _window_actual(window_minutes):
     actual, n = recorder.aggregate(window_minutes)
     if actual is None:
         live = get_live_sensor_data()
-        if not _sensor_feed_alive(live):
+        if not _feed_is_live(live):
             return None, 0
         recorder.record_sample(live)
         return {k: live.get(k, 0) for k in recorder.FIELDS}, 1
@@ -203,7 +222,8 @@ def run_cycle(station):
 
     actual, n = _window_actual(20)
     if actual is None:
-        print("!! No live samples this window — Bresser feed dead. Skipping.")
+        print("!! Station not connected (no fresh packet). Skipping — "
+              "nothing stored to Firebase this cycle.")
         set_pipeline_status("no_sensor_data", station)
         return
 
@@ -305,9 +325,10 @@ def run_hourly(station):
 
 
 def _sample_now():
-    """Take one live reading into the excel buffer (if the feed is alive)."""
+    """Take one live reading into the excel buffer (only if the station is
+    actually connected — a fresh, non-zero packet)."""
     live = get_live_sensor_data()
-    if _sensor_feed_alive(live):
+    if _feed_is_live(live):
         recorder.record_sample(live)
         return True
     return False

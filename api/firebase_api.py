@@ -51,10 +51,28 @@ def read_value(path, default=0):
 # READ LIVE SENSOR DATA
 # ==========================================================
 
+import time as _time
+
+
+def feed_age_seconds():
+    """Seconds since the webhook last wrote weather_station (its receivedAt is
+    epoch-ms). Returns None if there is no timestamp (never received). Used to
+    tell a LIVE station from a disconnected one whose last value is still
+    sitting in the node."""
+    try:
+        received = db.reference("weather_station/receivedAt").get()
+        if received is None:
+            return None
+        return max(0.0, _time.time() - float(received) / 1000.0)
+    except Exception:
+        return None
+
+
 def get_live_sensor_data():
     """Read the live Bresser reading from weather_station/payload — the same
-    node the dashboard uses — falling back to the legacy analytics/* paths
-    for any field the payload doesn't carry."""
+    node the dashboard uses. NOTE: this returns whatever is in the node even
+    if it is stale; callers must use feed_age_seconds() to decide whether the
+    station is actually connected before storing."""
 
     payload = {}
     try:
