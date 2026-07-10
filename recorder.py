@@ -62,6 +62,23 @@ def aggregate(window_minutes):
     return agg, len(window)
 
 
+def oldest_sample_age_minutes(window_minutes):
+    """How many minutes back the OLDEST sample within the trailing window
+    goes. 0.0 if the window is empty. A single fresh sample technically
+    satisfies aggregate() but doesn't represent a real accumulated window —
+    callers use this to require the buffer to genuinely SPAN close to the
+    full window (e.g. ~20 of 20 min) before treating an aggregate as
+    complete, so a store right after reconnecting waits for real data
+    instead of firing off one sample."""
+    now = datetime.now()
+    cutoff = now - timedelta(minutes=window_minutes)
+    window = [s for s in _samples if s["dt"] >= cutoff]
+    if not window:
+        return 0.0
+    oldest = min(s["dt"] for s in window)
+    return (now - oldest).total_seconds() / 60.0
+
+
 def write_result(kind, actual, predicted):
     """Record an aggregated actual-vs-predicted row to a results excel.
     kind: 'twentymin' or 'hourly'."""

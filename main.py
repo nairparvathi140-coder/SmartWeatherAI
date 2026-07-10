@@ -63,7 +63,10 @@ from prediction.predict import (
 
 LAST_COORDS_FILE = "models/last_coords.json"
 
-CONFIG_POLL_SECONDS = 60          # how often we check for a location change
+CONFIG_POLL_SECONDS = 10          # poll cadence — bounds detection latency for
+                                   # reconnection + slot-boundary crossing to
+                                   # ~10s (well inside the "10-15s is fine,
+                                   # not a full minute" tolerance)
 STALE_FEED_SECONDS = 900          # 15 min — no packet ⇒ station disconnected
 SAMPLE_INTERVAL_SECONDS = 300     # 5 min — sample a reading into the excel
 STORE_INTERVAL_SECONDS = 1200     # 20 min — aggregate + validate + store + refresh the hourly bucket
@@ -208,16 +211,24 @@ def ensure_trained(station):
         raise
 
 
-def _window_actual(window_minutes):
-    """Aggregated reading over the trailing window from the excel buffer;
-    falls back to a single live read if the buffer is empty (fresh start)."""
+def _window_actual(window_minutes, min_span_minutes=0):
+    """Aggregated reading over the trailing window from the excel buffer.
+    Returns (None, 0) if no samples have accumulated yet, OR if the buffer's
+    oldest sample doesn't reach back min_span_minutes — i.e. we refuse to
+    treat a single fresh sample (taken moments ago) as a complete window.
+
+    Without this, a station connecting at exactly 10:00 would sampling+store
+    almost instantly (sample_now() adds one live reading, then run_cycle
+    would immediately find that 1 sample and consider it a valid 20-min
+    aggregate) — the FIRST store must wait until the buffer genuinely spans
+    close to the full window, landing the first store at the next real slot
+    boundary (connect at 10:00 -> first store at 10:20), not the instant the
+    first packet arrives."""
     actual, n = recorder.aggregate(window_minutes)
     if actual is None:
-        live = get_live_sensor_data()
-        if not _feed_is_live(live):
-            return None, 0
-        recorder.record_sample(live)
-        return {k: live.get(k, 0) for k in recorder.FIELDS}, 1
+        return None, 0
+    if min_span_minutes and recorder.oldest_sample_age_minutes(window_minutes) < min_span_minutes:
+        return None, 0
     return actual, n
 
 
@@ -245,9 +256,10 @@ def run_cycle(station):
         set_pipeline_status("no_sensor_data", station)
         return False
 
-    actual, n = _window_actual(20)
+    actual, n = _window_actual(20, min_span_minutes=18)
     if actual is None:
-        print("!! No aggregate available despite a live feed — skipping.")
+        print("!! Feed is live but the 20-min window isn't full yet "
+              "(still accumulating since connect/reconnect) — skipping.")
         set_pipeline_status("no_sensor_data", station)
         return False
 
@@ -318,7 +330,11 @@ def run_hourly(station):
 
     Same live-connectivity guard as run_cycle(): the buffer can still hold
     samples from before a disconnect, so we refuse to write anything unless
-    the station is confirmed live RIGHT NOW."""
+    the station is confirmed live RIGHT NOW. Also requires the 60-min window
+    to genuinely span close to 60 min (oldest_sample_age_minutes >= 55)
+    before writing — same reasoning as run_cycle's 18-min gate: a station
+    that just connected shouldn't produce a sparse "hourly" average from a
+    couple of samples."""
     live_now = get_live_sensor_data()
     if not _feed_is_live(live_now):
         print("!! Station not connected — skipping hourly aggregate "
@@ -327,6 +343,10 @@ def run_hourly(station):
 
     actual, n = recorder.aggregate(60)
     if actual is None:
+        return
+    if recorder.oldest_sample_age_minutes(60) < 55:
+        # Same "genuine window, not a sparse partial average" requirement as
+        # run_cycle's 18-min gate, scaled to the 60-min hourly window.
         return
     now = datetime.now()
     date = now.strftime("%Y-%m-%d")
@@ -389,10 +409,12 @@ def main_loop(max_runtime_seconds=None):
     """Continuous loop — used locally, by the Cloud Run service, and by the
     GitHub Actions runner.
 
-    Two cadences off one 60s poll:
-      • sample the excel every 10 min (elapsed-time based — purely an
-        internal buffer feed, never surfaced with its own timestamp, so
-        clock alignment doesn't matter here).
+    Two cadences off one CONFIG_POLL_SECONDS poll:
+      • sample the excel every SAMPLE_INTERVAL_SECONDS while connected
+        (elapsed-time based — purely an internal buffer feed, never surfaced
+        with its own timestamp, so clock alignment doesn't matter here). A
+        failed attempt (station not connected) does NOT advance the timer,
+        so the next poll tick retries rather than waiting a full interval.
       • aggregate + validate + store every 20 min, keyed to the REAL clock
         slot (:00/:20/:40) via _slot(now) — NOT an elapsed-time timer.
         run_hourly() fires in the same tick, refreshing the current real
@@ -412,10 +434,10 @@ def main_loop(max_runtime_seconds=None):
 
         last_slot_key only advances when run_cycle() actually stores data
         (returns True). If the station is disconnected when a slot begins,
-        the slot key does NOT advance, so the very next poll tick (~60s
-        later, not the next 20-min slot) retries — the moment the station
-        reconnects mid-slot, data resumes within one poll interval instead
-        of waiting up to 20 minutes for the next boundary.
+        the slot key does NOT advance, so the very next poll tick (within
+        CONFIG_POLL_SECONDS, not the next 20-min slot) retries — the moment
+        the station reconnects mid-slot, data resumes within one poll
+        interval instead of waiting up to 20 minutes for the next boundary.
 
     When max_runtime_seconds is set (GitHub Actions caps a single job at 6h),
     the loop exits cleanly with status 0 after that budget so a scheduled
@@ -446,7 +468,10 @@ def main_loop(max_runtime_seconds=None):
             if retrained or (now_wall - last_sample_at) >= SAMPLE_INTERVAL_SECONDS:
                 if _sample_now():
                     print("· sampled a reading into the excel")
-                last_sample_at = now_wall
+                    last_sample_at = now_wall
+                # else: station not connected — leave last_sample_at alone so
+                # the next poll tick retries immediately instead of waiting
+                # another full SAMPLE_INTERVAL_SECONDS after reconnection.
 
             if retrained or current_slot_key != last_slot_key:
                 stored = run_cycle(station)
