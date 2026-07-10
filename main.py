@@ -217,13 +217,14 @@ def _window_actual(window_minutes, min_span_minutes=0):
     oldest sample doesn't reach back min_span_minutes — i.e. we refuse to
     treat a single fresh sample (taken moments ago) as a complete window.
 
-    Without this, a station connecting at exactly 10:00 would sampling+store
-    almost instantly (sample_now() adds one live reading, then run_cycle
+    Without this, a station connecting at exactly 10:00 would sample+store
+    almost instantly (_sample_now() adds one live reading, then run_cycle
     would immediately find that 1 sample and consider it a valid 20-min
-    aggregate) — the FIRST store must wait until the buffer genuinely spans
-    close to the full window, landing the first store at the next real slot
-    boundary (connect at 10:00 -> first store at 10:20), not the instant the
-    first packet arrives."""
+    aggregate). run_cycle passes min_span_minutes=20 (the FULL window, no
+    grace period): the earliest this can pass is exactly 20 real minutes
+    after the oldest sample, so a station connecting at 10:00 gets its first
+    store at 10:20 — never earlier — and _slot(now) at that moment correctly
+    computes "10:20" as the label (not a premature "10:00")."""
     actual, n = recorder.aggregate(window_minutes)
     if actual is None:
         return None, 0
@@ -256,7 +257,7 @@ def run_cycle(station):
         set_pipeline_status("no_sensor_data", station)
         return False
 
-    actual, n = _window_actual(20, min_span_minutes=18)
+    actual, n = _window_actual(20, min_span_minutes=20)
     if actual is None:
         print("!! Feed is live but the 20-min window isn't full yet "
               "(still accumulating since connect/reconnect) — skipping.")
@@ -323,31 +324,44 @@ def run_cycle(station):
 
 
 def run_hourly(station):
-    """Refresh the CURRENT real clock hour's trailing-60-min aggregate.
-    Called every 20-min cycle (not on its own timer) so the bucket for
-    hour "15:00" always exists within 20 min of the station being live at
-    that hour — see main_loop() for why a separate timer was unreliable.
+    """Write ONE entry for the CURRENT real clock hour, once — not a
+    refining series within the hour. main_loop() only calls this when the
+    real hour has just changed (see its docstring), so a station connected
+    continuously since 10:00 produces exactly: nothing at 10:00, one entry
+    at 11:00 (covering 10:00-11:00), one at 12:00 (covering 11:00-12:00),
+    and so on — never multiple partial entries inside the same hour.
+
+    Returns True if data was actually written, False if skipped (station
+    not connected, or the 60-min window isn't genuinely full yet) — the
+    caller uses this to decide whether to retry sooner (see main_loop()).
 
     Same live-connectivity guard as run_cycle(): the buffer can still hold
     samples from before a disconnect, so we refuse to write anything unless
-    the station is confirmed live RIGHT NOW. Also requires the 60-min window
-    to genuinely span close to 60 min (oldest_sample_age_minutes >= 55)
-    before writing — same reasoning as run_cycle's 18-min gate: a station
-    that just connected shouldn't produce a sparse "hourly" average from a
-    couple of samples."""
+    the station is confirmed live RIGHT NOW. Also requires the FULL 60-min
+    window (oldest_sample_age_minutes >= 60, no grace period) before writing.
+
+    The exact (not "close enough") threshold matters here for more than data
+    quality: it's what GUARANTEES the first successful write can only happen
+    at or after the real hour boundary. If the oldest sample is from 10:00
+    and we require >=60 real minutes of span, that can only become true once
+    real time reaches 11:00 — at which point now.hour is already 11, so the
+    write is correctly labeled "11:00" too. A looser threshold (e.g. 55)
+    would let this fire a few minutes EARLY, while still inside hour 10,
+    producing a premature "10:00" entry instead of waiting for "11:00"."""
     live_now = get_live_sensor_data()
     if not _feed_is_live(live_now):
         print("!! Station not connected — skipping hourly aggregate "
               "(nothing written).")
-        return
+        return False
 
     actual, n = recorder.aggregate(60)
     if actual is None:
-        return
-    if recorder.oldest_sample_age_minutes(60) < 55:
-        # Same "genuine window, not a sparse partial average" requirement as
-        # run_cycle's 18-min gate, scaled to the 60-min hourly window.
-        return
+        return False
+    if recorder.oldest_sample_age_minutes(60) < 60:
+        # Exact 60-min requirement — see docstring for why no grace period.
+        print("!! Feed is live but the 60-min window isn't full yet "
+              "(still accumulating since connect/reconnect) — skipping.")
+        return False
     now = datetime.now()
     date = now.strftime("%Y-%m-%d")
     hour = f"{now.hour:02d}:00"
@@ -381,6 +395,8 @@ def run_hourly(station):
     except Exception as e:
         print(f"Warning: could not update rolling aggregates: {e}")
 
+    return True
+
 
 def _sample_now():
     """Take one live reading into the excel buffer (only if the station is
@@ -409,35 +425,44 @@ def main_loop(max_runtime_seconds=None):
     """Continuous loop — used locally, by the Cloud Run service, and by the
     GitHub Actions runner.
 
-    Two cadences off one CONFIG_POLL_SECONDS poll:
+    Three cadences off one CONFIG_POLL_SECONDS poll, each anchored to the
+    ABSOLUTE real clock (never "time since this loop last fired"):
+
       • sample the excel every SAMPLE_INTERVAL_SECONDS while connected
         (elapsed-time based — purely an internal buffer feed, never surfaced
         with its own timestamp, so clock alignment doesn't matter here). A
         failed attempt (station not connected) does NOT advance the timer,
         so the next poll tick retries rather than waiting a full interval.
-      • aggregate + validate + store every 20 min, keyed to the REAL clock
-        slot (:00/:20/:40) via _slot(now) — NOT an elapsed-time timer.
-        run_hourly() fires in the same tick, refreshing the current real
-        hour's bucket (e.g. "15:00") with the trailing 60-min aggregate.
 
-        This must be anchored to the ABSOLUTE clock, not "time since last
-        fire": this loop restarts often (every ~6h automatically, and on
-        every redeploy), and an elapsed-time timer reseeds to 0 on every
-        restart, firing once immediately at whatever arbitrary moment the
-        process booted — then drifting further from real :00/:20/:40 marks
-        with every subsequent restart, compounding into the kind of 15-17
-        min offsets that showed up in Firebase. Comparing the CURRENT real
-        slot key against the last one we stored is self-correcting: every
-        tick re-derives "what slot should this be" straight from the clock,
-        so restarts, network delays, or a slow cycle never leave a lasting
-        offset — the next tick just catches up to wherever real time is.
+      • run_cycle(): every 20 min, keyed to the real clock slot (:00/:20/:40)
+        via _slot(now).
 
-        last_slot_key only advances when run_cycle() actually stores data
-        (returns True). If the station is disconnected when a slot begins,
-        the slot key does NOT advance, so the very next poll tick (within
-        CONFIG_POLL_SECONDS, not the next 20-min slot) retries — the moment
-        the station reconnects mid-slot, data resumes within one poll
-        interval instead of waiting up to 20 minutes for the next boundary.
+      • run_hourly(): once per real hour, keyed to (date, hour) — completely
+        DECOUPLED from the 20-min cycle. A station connected continuously
+        since 10:00 gets exactly one hourly write at 11:00 (covering
+        10:00-11:00), one at 12:00 (covering 11:00-12:00), and so on —
+        never a refining series of partial entries within the same hour.
+
+      Both the 20-min and hourly triggers must compare against the ABSOLUTE
+      clock, not "time since last fire": this loop restarts often (every
+      ~6h automatically, and on every redeploy), and an elapsed-time timer
+      reseeds to 0 on every restart, firing once immediately at whatever
+      arbitrary moment the process booted — then drifting further from real
+      :00/:20/:40 marks with every subsequent restart, compounding into the
+      kind of 15-17 min offsets that showed up in Firebase. Comparing the
+      CURRENT real slot/hour key against the last one we actually stored is
+      self-correcting: every tick re-derives "what slot/hour should this be"
+      straight from the clock, so restarts, network delays, or a slow cycle
+      never leave a lasting offset — the next tick just catches up to
+      wherever real time is.
+
+      last_slot_key / last_hourly_key only advance when the corresponding
+      function actually stores data (returns True). If the station is
+      disconnected (or the window isn't full yet) when a slot/hour begins,
+      the key does NOT advance, so the very next poll tick (within
+      CONFIG_POLL_SECONDS) retries — the moment the station reconnects mid-
+      window, data resumes within one poll interval instead of waiting for
+      the next boundary.
 
     When max_runtime_seconds is set (GitHub Actions caps a single job at 6h),
     the loop exits cleanly with status 0 after that budget so a scheduled
@@ -448,12 +473,13 @@ def main_loop(max_runtime_seconds=None):
     print("=" * 60)
     print("SMART WEATHER AI — service starting")
     print(f"poll {CONFIG_POLL_SECONDS}s · sample {SAMPLE_INTERVAL_SECONDS // 60}min "
-          f"· cycle+hourly aligned to real {STORE_INTERVAL_SECONDS // 60}-min clock slots")
+          f"· cycle every {STORE_INTERVAL_SECONDS // 60}min · hourly once per real hour")
     print("=" * 60)
 
     started_at = time.time()
     last_sample_at = 0.0
-    last_slot_key = None   # (date, "HH:MM") of the last slot we ran a cycle for
+    last_slot_key = None    # (date, "HH:MM") of the last 20-min slot stored
+    last_hourly_key = None  # (date, "HH") of the last hour stored
 
     while True:
         try:
@@ -463,7 +489,9 @@ def main_loop(max_runtime_seconds=None):
             retrained = ensure_trained(station)
 
             now_wall = time.time()
-            current_slot_key = _slot(datetime.now())
+            now_dt = datetime.now()
+            current_slot_key = _slot(now_dt)
+            current_hourly_key = (now_dt.strftime("%Y-%m-%d"), f"{now_dt.hour:02d}")
 
             if retrained or (now_wall - last_sample_at) >= SAMPLE_INTERVAL_SECONDS:
                 if _sample_now():
@@ -475,12 +503,17 @@ def main_loop(max_runtime_seconds=None):
 
             if retrained or current_slot_key != last_slot_key:
                 stored = run_cycle(station)
-                run_hourly(station)
                 if stored:
                     last_slot_key = current_slot_key
-                # else: station not connected — leave last_slot_key alone so
-                # the very next poll tick retries this same slot instead of
-                # waiting for the next 20-min boundary.
+                # else: station not connected (or window not full yet) —
+                # leave last_slot_key alone so the very next poll tick
+                # retries this same slot instead of waiting 20 minutes.
+
+            if retrained or current_hourly_key != last_hourly_key:
+                hourly_stored = run_hourly(station)
+                if hourly_stored:
+                    last_hourly_key = current_hourly_key
+                # else: same retry-next-tick pattern, but for the hour.
 
         except Exception as e:
             print(f"ERROR: {e}")
